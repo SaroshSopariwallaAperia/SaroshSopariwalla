@@ -1,0 +1,1 @@
+Use `conda activate SaroshEnv` to activate virtual environment in terminal and do pip installs.

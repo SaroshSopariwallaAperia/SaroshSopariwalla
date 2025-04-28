@@ -1,0 +1,131 @@
+
+WITH indexed_events AS (
+    SELECT
+        event_table.event_id,
+        event_table.unique_id,
+        event_table.event_type,
+        event_table.pressure_date AS event_table__pressure_date,
+        event_table.ts_created AS event_table__ts_created,
+        RANK() OVER (PARTITION BY event_table.event_id ORDER BY event_status_id ASC) as event_update_rank_ASC,
+        RANK() OVER (PARTITION BY event_table.event_id ORDER BY event_status_id DESC) as event_update_rank_DESC, 
+        event_status.event_status_id,
+        event_status.ts_created AS event_status__ts_created,
+        event_status.severity,
+        event_status.status,
+        event_status.pressure_date AS event_status__pressure_date,
+        RANK() OVER (PARTITION BY event_table.event_id, meta_data.unique_id ORDER BY meta_data.id DESC) as meta_data_id_rank_desc,
+        meta_data.side,
+        meta_data.axle,
+        meta_data.position,
+        meta_data.sensor_number,
+        fleet_meta_data.fleet_name,
+        vehicle_meta_data.fleet_vehicle_id,
+        vehicle_groups.name as vehicle_group
+    FROM
+        halo_connect_customer_data.event_table INNER JOIN halo_connect_customer_data.event_status
+            ON event_table.event_id = event_status.event_id
+        INNER JOIN halo_connect_customer_data.meta_data
+            ON (meta_data.unique_id = event_table.unique_id
+                AND meta_data.created_at < event_table.pressure_date
+                AND (meta_data.deactivated_at > event_table.pressure_date OR meta_data.deactivated_at IS NULL))
+        INNER JOIN halo_connect_customer_data.vehicle_meta_data
+            ON (vehicle_meta_data.vehicle_id = meta_data.vehicle_id
+                AND vehicle_meta_data.created_at < event_table.pressure_date
+                AND (vehicle_meta_data.retired_at > event_table.pressure_date OR vehicle_meta_data.retired_at IS NULL))
+        INNER JOIN halo_connect_customer_data.fleet_meta_data
+            ON fleet_meta_data.fleet_id = vehicle_meta_data.fleet_id
+        LEFT JOIN halo_connect_customer_data.vehicle_groups_vehicles
+            ON vehicle_meta_data.vehicle_id = vehicle_groups_vehicles.vehicle_id
+        LEFT JOIN halo_connect_customer_data.vehicle_groups ON vehicle_groups_vehicles.vehicle_group_id = vehicle_groups.id 
+    WHERE
+        event_table.event_type != 'MAINT'
+        AND event_table.ts_created >= date_trunc('year', CURRENT_DATE)::date
+        AND fleet_meta_data.code NOT IN ('Y87BQV9', 'X77OKO7', '1L10O39N', '1GOPAPMF', '3FF99DS', '1FBR7DGI', '1M5190AC', '19RVO6ZP')
+        AND fleet_meta_data.status = 'ACTIVE'
+),
+indexed_sensor_data AS (
+    SELECT
+        unique_id,
+        pressure_date,
+        pressure,
+        speed,
+        latitude,
+        longitude,
+        ROW_NUMBER() OVER(PARTITION BY unique_id, pressure_date ORDER BY speed ASC, pressure DESC) as row_number
+    FROM
+        halo_connect_customer_data.sensor_data
+    WHERE
+        pressure_date >= date_trunc('year', CURRENT_DATE)::date
+)
+SELECT DISTINCT
+    event_id,
+    event_table__ts_created as ts_created,
+    MIN(CASE WHEN event_update_rank_DESC = 1 THEN severity END) AS current_severity,
+    MIN(CASE WHEN event_update_rank_DESC = 1 THEN indexed_events.status END) AS current_status,
+    event_type,
+    event_table__pressure_date AS pressure_date,
+    side,
+    axle,
+    position,
+    sensor_number,
+    fleet_name,
+    CASE
+        WHEN fleet_name = 'TOMY' THEN 'TOMY'
+        ELSE 'AFP'
+    END as maint_provider,
+    vehicle_group,
+    fleet_vehicle_id,
+    CASE
+        WHEN COUNT(DISTINCT severity) > 1 THEN 'Y'
+        ELSE 'N'
+    END AS escalated,
+    MIN(CASE WHEN severity = 'MINOR' THEN event_status__ts_created END) as minor_ts,
+    COALESCE(
+        EXTRACT(EPOCH FROM MIN(CASE WHEN severity = 'MAJOR' THEN event_status__ts_created END) - MIN(CASE WHEN severity = 'MINOR' THEN event_status__ts_created END)) / 86400.0,
+        EXTRACT(EPOCH FROM MIN(CASE WHEN severity = 'CRITICAL' THEN event_status__ts_created END) - MIN(CASE WHEN severity = 'MINOR' THEN event_status__ts_created END)) / 86400.0,
+        EXTRACT(EPOCH FROM MIN(CASE WHEN indexed_events.status = 'CLOSED' THEN event_status__ts_created END) - MIN(CASE WHEN severity = 'MINOR' THEN event_status__ts_created END)) / 86400.0
+    ) as minor_duration,
+    MIN(CASE WHEN severity = 'MAJOR' THEN event_status__ts_created END) as major_ts,
+    COALESCE(
+        EXTRACT(EPOCH FROM MIN(CASE WHEN severity = 'CRITICAL' THEN event_status__ts_created END) - MIN(CASE WHEN severity = 'MAJOR' THEN event_status__ts_created END)) / 86400.0,
+        EXTRACT(EPOCH FROM MIN(CASE WHEN indexed_events.status = 'CLOSED' THEN event_status__ts_created END) - MIN(CASE WHEN severity = 'MAJOR' THEN event_status__ts_created END)) / 86400.0
+    ) as major_duration,
+    MIN(CASE WHEN severity = 'CRITICAL' THEN event_status__ts_created END) as critical_ts,
+    EXTRACT(EPOCH FROM MIN(CASE WHEN indexed_events.status = 'CLOSED' THEN event_status__ts_created END) - MIN(CASE WHEN severity = 'CRITICAL' THEN event_status__ts_created END)) / 86400.0 as critical_duration,
+    MIN(CASE WHEN event_update_rank_ASC = 1 THEN severity END) AS first_severity,
+    MIN(CASE WHEN event_update_rank_DESC = 1 THEN severity END) AS last_severity,
+    MAX(event_status__ts_created) AS last_change_ts,
+    EXTRACT(EPOCH FROM MAX(CASE WHEN indexed_events.status = 'CLOSED' THEN event_status__ts_created END) - MIN(CASE WHEN indexed_events.status = 'CLOSED' THEN event_table__ts_created END)) / 86400.0 AS time_to_resolution,
+    CASE
+        WHEN MAX(CASE WHEN event_update_rank_DESC = 1 THEN indexed_events.status END) = 'OPEN' THEN
+            EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - MIN(event_status__ts_created)) / 86400.0
+    END AS open_age,
+    isd.pressure AS tire_pressure_at_detection,
+    CASE 
+      WHEN isd.speed IS NOT NULL THEN isd.latitude || ', ' || isd.longitude 
+      ELSE NULL 
+    END AS location_at_detection
+FROM 
+    indexed_events LEFT JOIN (SELECT * FROM indexed_sensor_data WHERE row_number = 1) isd
+        ON (indexed_events.event_table__pressure_date = isd.pressure_date
+            AND indexed_events.unique_id = isd.unique_id)
+WHERE
+    meta_data_id_rank_desc = 1
+GROUP BY
+    event_id,
+    isd.pressure,
+    isd.speed, isd.latitude, isd.longitude,
+    event_table__ts_created,
+    event_type,
+    event_table__pressure_date,
+    side,
+    axle,
+    position,
+    sensor_number,
+    fleet_name,
+    CASE
+        WHEN fleet_name = 'TOMY' THEN 'TOMY'
+        ELSE 'AFP'
+    END,
+    vehicle_group,
+    fleet_vehicle_id

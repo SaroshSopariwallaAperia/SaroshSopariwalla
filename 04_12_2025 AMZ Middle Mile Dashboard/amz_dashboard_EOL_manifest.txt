@@ -1,0 +1,12 @@
+
+SELECT
+    code,
+    fleet_name,
+    vehicle_id,
+    fleet_vehicle_id,
+    archived
+FROM
+    halo_connect_customer_data.fleet_meta_data INNER JOIN halo_connect_customer_data.vehicle_meta_data
+        ON fleet_meta_data.fleet_id = vehicle_meta_data.fleet_id
+WHERE
+    fleet_meta_data.code = '19RVO6ZP' -- EOL

@@ -1,0 +1,62 @@
+
+WITH closed_alerts AS (
+    SELECT
+        event_status.event_id,
+        event_status.ts_created::date AS closed_date,
+        event_status.severity,
+        fleet_meta_data.fleet_name,
+        vehicle_groups.name AS vehicle_group,
+        CASE 
+            WHEN fleet_meta_data.fleet_name = 'TOMY' THEN 'TOMY'
+            ELSE 'AFP'
+        END AS maint_provider
+    FROM
+        halo_connect_customer_data.event_table
+    INNER JOIN halo_connect_customer_data.event_status
+        ON event_table.event_id = event_status.event_id
+    INNER JOIN halo_connect_customer_data.meta_data
+        ON meta_data.unique_id = event_table.unique_id
+    INNER JOIN halo_connect_customer_data.vehicle_meta_data
+        ON vehicle_meta_data.vehicle_id = meta_data.vehicle_id
+    INNER JOIN halo_connect_customer_data.fleet_meta_data
+        ON fleet_meta_data.fleet_id = vehicle_meta_data.fleet_id
+    LEFT JOIN halo_connect_customer_data.vehicle_groups_vehicles
+        ON vehicle_meta_data.vehicle_id = vehicle_groups_vehicles.vehicle_id
+    LEFT JOIN halo_connect_customer_data.vehicle_groups
+        ON vehicle_groups_vehicles.vehicle_group_id = vehicle_groups.id
+    WHERE
+        event_table.event_type != 'MAINT'
+        AND meta_data.id IN (
+            SELECT MAX(id)
+            FROM halo_connect_customer_data.meta_data
+            GROUP BY unique_id
+        )
+        AND event_table.ts_created >= date_trunc('year', CURRENT_DATE)::date
+        AND fleet_meta_data.code NOT IN ('Y87BQV9', 'X77OKO7', '1L10O39N', '1GOPAPMF', '3FF99DS', '1FBR7DGI', '1M5190AC', '19RVO6ZP')
+        AND fleet_meta_data.status = 'ACTIVE'
+        AND event_status.event_status_id IN (
+            SELECT MAX(event_status_id)
+            FROM halo_connect_customer_data.event_status
+            WHERE status = 'CLOSED'
+            GROUP BY event_id
+        )
+
+
+)
+SELECT
+    closed_date,
+    severity,
+    fleet_name,
+    vehicle_group,
+    maint_provider,
+    COUNT(DISTINCT event_id) AS num_alerts_closed
+FROM
+    closed_alerts
+GROUP BY
+    closed_date,
+    severity,
+    fleet_name,
+    vehicle_group,
+    maint_provider
+ORDER BY
+    closed_date
