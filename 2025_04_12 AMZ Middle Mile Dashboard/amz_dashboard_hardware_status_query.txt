@@ -1,0 +1,101 @@
+
+WITH vehicle_list AS (
+    SELECT
+        fleet_meta_data.fleet_name,
+        vehicle_groups.name as vehicle_group,
+        vehicle_meta_data.vehicle_id,
+        vehicle_meta_data.fleet_vehicle_id,
+        vehicle_meta_data.vehicle_type,
+        vehicle_meta_data.vin_number
+    FROM
+        halo_connect_customer_data.fleet_meta_data INNER JOIN halo_connect_customer_data.vehicle_meta_data
+            ON fleet_meta_data.fleet_id = vehicle_meta_data.fleet_id
+        LEFT JOIN halo_connect_customer_data.vehicle_groups_vehicles
+            ON vehicle_meta_data.vehicle_id = vehicle_groups_vehicles.vehicle_id
+        LEFT JOIN halo_connect_customer_data.vehicle_groups 
+            ON vehicle_groups_vehicles.vehicle_group_id = vehicle_groups.id 
+    WHERE
+        fleet_meta_data.status = 'ACTIVE'
+        AND vehicle_meta_data.archived = 0
+        AND fleet_meta_data.code NOT IN ('Y87BQV9', 'X77OKO7', '1L10O39N', '1GOPAPMF', '3FF99DS', '1FBR7DGI', '1M5190AC', '19RVO6ZP')
+        AND fleet_meta_data.status = 'ACTIVE'
+),
+sensor_analytics AS (
+    SELECT
+        vehicle_meta_data.vehicle_id,
+        meta_data.side || meta_data.axle || meta_data.position as tire,
+        MAX(pressure_date) as last_sensor_transmission,
+        CURRENT_TIMESTAMP - MAX(pressure_date) as time_since_last_sensor_transmission
+    FROM
+        halo_connect_customer_data.vehicle_meta_data INNER JOIN halo_connect_customer_data.meta_data
+            ON vehicle_meta_data.vehicle_id = meta_data.vehicle_id
+        INNER JOIN halo_connect_customer_data.sensor_data
+            ON meta_data.id = sensor_data.meta_data_id
+    WHERE
+        (CASE WHEN vehicle_meta_data.vehicle_type = 'Tractor Tandem-Dual' THEN meta_data.axle <= 3 ELSE 1=1 END)
+        AND vehicle_meta_data.archived = 0
+    GROUP BY
+        vehicle_meta_data.vehicle_id,
+        meta_data.side || meta_data.axle || meta_data.position
+),
+gw_analytics AS (
+    SELECT
+        vehicle_meta_data.vehicle_id,
+        gateway_meta_data.gateway_id,
+        gateway_meta_data.type as gateway_type,
+        CASE
+            WHEN gateway_meta_data.type = 'APOLLO' THEN MAX(file_meta_data.file_upload_time)
+            WHEN gateway_meta_data.type = 'GEMINI' THEN TIMESTAMP 'epoch' + (MAX(heartbeat.event_timestamp) / 1000) * INTERVAL '1 second'
+        END as last_gw_transmission
+    FROM
+        halo_connect_customer_data.vehicle_meta_data INNER JOIN halo_connect_customer_data.gateway_meta_data
+            ON vehicle_meta_data.cycle_number = gateway_meta_data.cycle_number
+        LEFT JOIN halo_connect_customer_data.file_meta_data
+            ON file_meta_data.cycle_number = gateway_meta_data.cycle_number
+        LEFT JOIN (SELECT * FROM "prod-gem-plat-event-database"."prod-gem-plat-event-table" WHERE measure_name = 'heartbeat') heartbeat
+            ON heartbeat.device_id= gateway_meta_data.gateway_id
+    WHERE
+        file_meta_data.id IN (SELECT MAX(id) FROM halo_connect_customer_data.file_meta_data GROUP BY cycle_number)
+    GROUP BY
+        vehicle_meta_data.vehicle_id,
+        gateway_meta_data.gateway_id,
+        gateway_meta_data.type
+)
+SELECT
+    vehicle_list.fleet_name,
+    CASE
+        WHEN fleet_name = 'TOMY' THEN 'TOMY'
+        ELSE 'AFP'
+    END AS maint_provider,
+    vehicle_list.vehicle_group,
+    vehicle_list.vehicle_id,
+    vehicle_list.fleet_vehicle_id,
+    vehicle_list.vehicle_type,
+    vehicle_list.vin_number,
+    MAX(gw_analytics.last_gw_transmission) last_gw_transmission,
+    CASE
+        WHEN (CURRENT_TIMESTAMP - MAX(gw_analytics.last_gw_transmission) >= INTERVAL '2 DAY') OR (MAX(gw_analytics.last_gw_transmission) IS NULL) THEN 'OFFLINE'
+        ELSE 'ONLINE'
+    END AS gateway_status,
+    SUM(
+        CASE
+            WHEN sensor_analytics.time_since_last_sensor_transmission >= INTERVAL '2 DAY' THEN 1
+            ELSE 0
+        END
+    ) AS number_offline_sensors
+FROM
+    vehicle_list LEFT JOIN sensor_analytics
+        ON vehicle_list.vehicle_id = sensor_analytics.vehicle_id
+    LEFT JOIN gw_analytics
+        ON gw_analytics.vehicle_id = vehicle_list.vehicle_id
+GROUP BY
+    vehicle_list.fleet_name,
+    CASE
+        WHEN fleet_name = 'TOMY' THEN 'TOMY'
+        ELSE 'AFP'
+    END,
+    vehicle_list.vehicle_group,
+    vehicle_list.vehicle_id,
+    vehicle_list.fleet_vehicle_id,
+    vehicle_list.vehicle_type,
+    vehicle_list.vin_number
