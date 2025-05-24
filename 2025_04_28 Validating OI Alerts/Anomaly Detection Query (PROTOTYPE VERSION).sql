@@ -1,0 +1,785 @@
+      -- 0. Data Preprocessing
+      -- 0.1 Get the reading_diffs to help filter out erroneous data points
+      WITH reading_diffs AS (
+        SELECT
+          device_id,
+          fleet_activation_code,
+          sensor_id,
+          CASE
+            WHEN sensor_id LIKE '%\\_2' ESCAPE '\\' OR sensor_id LIKE '%\\_3' ESCAPE '\\' THEN 'cyclone_sensor'
+            ELSE 'screw_on_sensor'
+          END as sensor_type,
+          time,
+          from_milliseconds(cast(transmission_timestamp as bigint)) transmission_timestamp,
+          set_point,
+          pressure,
+          temperature,
+          gps_speed speed,
+          recvd,
+          pressure - LAG(pressure) OVER (
+            PARTITION BY
+              device_id,
+              fleet_activation_code,
+              sensor_id
+            ORDER BY
+              time ASC
+          ) pressure_diff,
+          ABS(
+            temperature - LAG(temperature) OVER (
+              PARTITION BY
+                device_id,
+                fleet_activation_code,
+                sensor_id
+              ORDER BY
+                time ASC
+            )
+          ) abs_temp_diff,
+          (
+            time - LAG(time) OVER (
+              PARTITION BY
+                device_id,
+                fleet_activation_code,
+                sensor_id
+              ORDER BY
+                time ASC
+            )
+          ) time_diff,
+          RANK() OVER (
+            PARTITION BY
+              device_id,
+              fleet_activation_code,
+              sensor_id,
+              bin(time, 5m)
+            ORDER BY
+              pressure ASC
+          ) pressure_rankings,
+          -- the value 48 was selected because the query scans 48 hours of data, which should approximately give one data point per hour
+          CASE
+            WHEN COUNT(1) OVER (
+              PARTITION BY
+                device_id,
+                fleet_activation_code,
+                sensor_id
+            ) >= 48
+            THEN
+              APPROX_PERCENTILE(pressure, 0.10) OVER (
+                PARTITION BY
+                  device_id,
+                  fleet_activation_code,
+                  sensor_id
+                ORDER BY
+                  time ASC
+              )
+            ELSE NULL
+          END AS raw_pressure_based_cip
+        FROM
+          "prod-gem-plat-event-database"."prod-gem-plat-event-table-partitioned"
+        WHERE
+          pressure >= -4 -- Readings less than -4 are invalid
+        AND
+          temperature >= -30
+        AND
+          temperature <= 100 -- we aren't focused on tire fires right now
+        AND
+          time > ago(2d)
+        AND
+          event_type = 'tpms'
+      ),
+      -- 0.2 Smooth Sensor Data to 5 Minute Intervals
+      binned_agg_5_min AS (
+        SELECT
+          device_id,
+          fleet_activation_code,
+          sensor_id,
+          sensor_type,
+          bin(time, 5m) time_bin,
+          max(transmission_timestamp) latest_transmission_timestamp,
+          max(set_point) set_point,
+          min(pressure) min_pressure,
+          avg(pressure) avg_pressure,
+          avg(temperature) temperature,
+          avg(speed) speed,
+          SUM(
+            CASE
+              WHEN pressure_diff >= 20 THEN 1
+              ELSE 0
+            END
+          ) numb_pressure_spikes, --  quantifies how many times pressure jumped up by 20 PSI in each 5 minute interval
+          CASE WHEN MAX(recvd) > COUNT(1) THEN MAX(recvd) ELSE COUNT(1) END readings,
+          -- TODO: this value might be affected too, check with Sarosh if using MIN_BY will not break anything
+          MAX(CASE WHEN pressure_rankings = 1 THEN speed END) speed_for_BO_MAINT_detection,
+          MIN_BY(time, pressure) minimized_pressure_timestamp,
+          MAX_BY(raw_pressure_based_cip, time) raw_pressure_based_cip
+        FROM
+          reading_diffs
+        WHERE
+        (
+          NOT (
+            (time_diff <= 1s)
+            AND (pressure_diff <= -60)
+          )
+        )
+        AND
+        (
+          NOT (
+            (time_diff < 6m)
+            AND (abs_temp_diff > 15)
+          )
+        ) -- we exclude rows that are less than 6 minutes apart but the temperature jumps over 15°C b/c they are erroneous
+        AND NOT ((time_diff < 1m) AND (abs_temp_diff > 5))
+        OR (
+          (time_diff IS NULL)
+          AND (abs_temp_diff IS NULL)
+        ) -- the check above will get rid of the first reading in every time_bin so lets not do that
+        GROUP BY
+          device_id,
+          fleet_activation_code,
+          sensor_id,
+          sensor_type,
+          bin(time, 5m)
+        -- the code is commented temporarily to check if it helps to avoid some false positives
+        -- HAVING NOT (
+        --   COUNT(1) = SUM(CASE WHEN pressure <= 4 THEN 1 ELSE 0 END)
+        --     AND
+        --   var_pop(pressure) = 0
+        -- )
+      ),
+      -- 0.3 Smooth GPS/Vehicle Data to 5 Minute Intervals
+      vehicle_agg_5_min as (
+        SELECT
+          device_id,
+          time_bin,
+          min(speed) vehicle_min_speed
+        FROM
+          binned_agg_5_min
+        GROUP BY
+          device_id,
+          time_bin
+      ),
+      -- 0.4 Smooth Data to 1 Hour Intervals for Cold Snap Detection
+      binned_agg_1_hr as (
+        SELECT
+          device_id,
+          bin(time_bin, 1h) time_bin_hr,
+          APPROX_PERCENTILE(temperature, 0.10) AS tenth_percentile_temp,
+          avg(speed) avg_speed
+        FROM
+          binned_agg_5_min
+        GROUP BY
+          device_id,
+          bin(time_bin, 1h)
+      ),
+      -- 0.5 Calculate CIP for Each Sensor
+      approx_cip AS (
+        SELECT
+          binned_agg_5_min.device_id device_id,
+          sensor_id,
+          sensor_type,
+          time_bin,
+          latest_transmission_timestamp,
+          minimized_pressure_timestamp,
+          avg_pressure,
+          set_point,
+          temperature,
+          (temperature - ba_1_hr.tenth_percentile_temp) temperature_delta,
+          APPROX_PERCENTILE(avg_pressure, 0.10) OVER (
+            PARTITION BY
+              sensor_id
+            ORDER BY
+              time_bin ASC
+          ) cip,
+          numb_pressure_spikes,
+          AVG(binned_agg_5_min.avg_pressure) OVER(PARTITION BY binned_agg_5_min.device_id, binned_agg_5_min.sensor_id ORDER BY binned_agg_5_min.time_bin DESC ROWS BETWEEN 3 PRECEDING AND 0 PRECEDING) fifteen_min_running_avg_pressure
+        FROM
+          binned_agg_5_min
+        LEFT OUTER JOIN
+          binned_agg_1_hr ba_1_hr
+        ON
+          binned_agg_5_min.device_id = ba_1_hr.device_id
+        AND
+          date_trunc('hour', binned_agg_5_min.time_bin) = date_add('day', 1, ba_1_hr.time_bin_hr)
+        WHERE
+          (sensor_type = 'screw_on_sensor' AND readings > 1)
+          OR
+          (sensor_type = 'cyclone_sensor')
+      ),
+      -- 1. Check for MAINT/BO
+      -- 1.1 Calculate the relevant metrics for MAINT/BO Detection
+      MAINT_BO__raw_data as (
+        SELECT
+          ba_5_min.device_id,
+          ba_5_min.sensor_id,
+          ba_5_min.sensor_type,
+          ba_5_min.time_bin,
+          ba_5_min.latest_transmission_timestamp,
+          ba_5_min.minimized_pressure_timestamp,
+          ba_5_min.min_pressure,
+          ba_5_min.readings,
+          ba_5_min.set_point,
+          ba_5_min.avg_pressure,
+          ba_5_min.temperature,
+          ba_5_min.numb_pressure_spikes,
+          -- Compute the Running Average Over the Preceding 4 Records (~20 Minutes)
+          CASE
+            -- Confirm there are actually 4 rows behind the current one
+            WHEN COUNT(1) OVER (
+              PARTITION BY
+                sensor_id
+              ORDER BY
+                ba_5_min.time_bin ASC
+              ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+            ) = 4 THEN AVG(ba_5_min.avg_pressure) OVER (
+              PARTITION BY
+                sensor_id
+              ORDER BY
+                ba_5_min.time_bin ASC
+              ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+            )
+            ELSE NULL
+          END twenty_min_running_avg,
+          -- Vehicle speed is used to check if BO v. MAINT
+          ba_5_min.speed_for_BO_MAINT_detection speed,
+           LAG(ba_5_min.avg_pressure) OVER (
+            PARTITION BY
+              device_id,
+              fleet_activation_code,
+              sensor_id
+            ORDER BY
+              time_bin DESC
+          ) - ba_5_min.avg_pressure as next_pressure_jump
+        FROM
+          binned_agg_5_min ba_5_min
+      ),
+      -- 1.2 Simple Feature Engineering to Clean Up Final Detection
+      MAINT_BO__cleaned_data as (
+        SELECT
+          MAINT_BO__raw_data.device_id,
+          sensor_id,
+          sensor_type,
+          time_bin,
+          latest_transmission_timestamp,
+          minimized_pressure_timestamp,
+          numb_pressure_spikes,
+          readings,
+          set_point,
+          avg_pressure pressure,
+          temperature,
+          next_pressure_jump,
+          (
+            MAINT_BO__raw_data.temperature - ba_1_hr.tenth_percentile_temp
+          ) temperature_delta,
+          CASE
+            WHEN twenty_min_running_avg - min_pressure >= 20 THEN TRUE
+            ELSE FALSE
+          END twenty_psi_drop,
+          CASE
+            WHEN (min_pressure <= 4) THEN TRUE
+            ELSE FALSE
+          END pressure_dropped_below_4PSI,
+          MAINT_BO__raw_data.speed,
+          CASE
+            WHEN (MAINT_BO__raw_data.speed > 3)
+            AND (numb_pressure_spikes < 1) -- in a real BO there will be no pressure spikes over 20 PSI in the 5 min window
+            THEN 'BO'
+            WHEN (MAINT_BO__raw_data.speed <= 3) OR (MAINT_BO__raw_data.speed IS NULL) OR (next_pressure_jump >= 10) THEN 'MAINT'
+            ELSE NULL
+          END event_type
+        FROM
+          MAINT_BO__raw_data
+        LEFT OUTER JOIN
+          binned_agg_1_hr ba_1_hr
+        ON
+          MAINT_BO__raw_data.device_id = ba_1_hr.device_id
+        AND
+          date_trunc('hour', MAINT_BO__raw_data.time_bin) = date_add('day', 1, ba_1_hr.time_bin_hr)
+      ),
+      detected_BO_MAINTs as (
+        SELECT
+          mb.device_id,
+          mb.sensor_id,
+          mb.event_type,
+          mb.time_bin,
+          mb.latest_transmission_timestamp,
+          mb.minimized_pressure_timestamp,
+          mb.set_point,
+          mb.pressure,
+          mb.temperature,
+          mb.temperature_delta,
+          CASE
+            WHEN mb.temperature_delta < -11 THEN 1
+            ELSE 0
+          END coldsnap_flag,
+          approx_cip.cip,
+          NULL override_blowout
+        FROM
+          MAINT_BO__cleaned_data mb
+        LEFT JOIN
+          approx_cip
+        ON
+          mb.device_id = approx_cip.device_id
+        AND
+          mb.sensor_id = approx_cip.sensor_id
+        AND
+          mb.time_bin = approx_cip.time_bin
+        WHERE
+        (  (twenty_psi_drop = TRUE
+        AND
+          pressure_dropped_below_4PSI = TRUE
+        AND
+          CASE
+            WHEN event_type = 'BO' AND mb.sensor_type = 'screw_on_sensor'
+            THEN readings > 1
+            ELSE true
+          END) OR (mb.next_pressure_jump >= 10) AND mb.event_type = 'MAINT')
+        AND event_type IS NOT NULL
+      ),
+      -- 2. Check for LEAK
+      -- 2.1 Detect leaks by checking if the pressure has fallen below CIP. Such an approach allows us to detect leaks before we hit any UI thresholds ideally too.
+      detected_LEAKs as (
+        SELECT
+          approx_cip.device_id device_id,
+          approx_cip.sensor_id sensor_id,
+          'LEAK' event_type,
+          approx_cip.time_bin time_bin,
+          approx_cip.latest_transmission_timestamp latest_transmission_timestamp,
+          approx_cip.minimized_pressure_timestamp minimized_pressure_timestamp,
+          approx_cip.set_point set_point,
+          approx_cip.avg_pressure pressure,
+          approx_cip.temperature,
+          approx_cip.temperature_delta,
+          CASE
+            WHEN approx_cip.temperature_delta < -11 THEN 1
+            ELSE 0
+          END coldsnap_flag,
+          approx_cip.cip,
+          fifteen_min_running_avg_pressure >= 30 override_blowout
+        FROM
+          approx_cip
+        INNER JOIN
+          vehicle_agg_5_min
+        ON
+          approx_cip.device_id = vehicle_agg_5_min.device_id
+        AND
+          approx_cip.time_bin = vehicle_agg_5_min.time_bin
+        WHERE
+          approx_cip.cip IS NOT NULL
+        AND
+          (
+            (
+              (vehicle_agg_5_min.vehicle_min_speed >= 15)
+                AND
+              (approx_cip.avg_pressure <= approx_cip.cip - 10)
+            )
+              OR
+            (
+              (vehicle_agg_5_min.vehicle_min_speed < 15 OR vehicle_agg_5_min.vehicle_min_speed IS NULL)
+                AND
+              (
+                CASE
+                  WHEN approx_cip.cip <= 25
+                  THEN approx_cip.avg_pressure < approx_cip.cip/2
+                  ELSE approx_cip.avg_pressure < approx_cip.cip/1.2
+                END
+              )
+            )
+          )
+        AND
+          approx_cip.numb_pressure_spikes = 0
+      ),
+      -- 2.2 In the state manager, we track UI escalation to detect leaks as well
+      --- Say a UI alert escalates in x hours
+      ---            If x <= 24 hours, raise critical leak
+      ---            If 24 hours < x <= 72 hours, raise major leak
+      ---            If 72 hours < x < (7*24 = 168) hours, raise minor leak
+      ---            We could potentially define leak severity using UI severity thresholds
+      -- 3. Check for UI
+      -- 3.1 Calculate the relevant metrics for UI Detection
+      detected_UI__raw_data as (
+        SELECT
+          binned_agg_5_min.device_id,
+          sensor_id,
+          sensor_type,
+          time_bin,
+          latest_transmission_timestamp,
+          minimized_pressure_timestamp,
+          set_point,
+          avg_pressure pressure,
+          temperature,
+          (temperature - ba_1_hr.tenth_percentile_temp) temperature_delta,
+          CASE
+            WHEN (temperature - ba_1_hr.tenth_percentile_temp) < -11 THEN 1
+            ELSE 0
+          END coldsnap_flag,
+          avg_pressure/set_point pressure_set_point_ratio,
+          lag(avg_pressure/set_point, 1, 1) over(partition by sensor_id order by time_bin asc) preceding_pressure_set_point_ratio,
+          COALESCE(threshold_table.minor_threshold, 0.85) as minor_threshold,
+          readings,
+          CASE
+            WHEN
+              (time_bin - LAG(time_bin) OVER(PARTITION BY sensor_id ORDER BY time_bin ASC) > 3.5h) AND
+              (time_bin - LAG(time_bin) OVER(PARTITION BY sensor_id ORDER BY time_bin ASC) < 4.5h) THEN 'LION'
+            ELSE
+              'EXTERN'
+          END inferred_power_mode,
+          AVG(binned_agg_5_min.avg_pressure) OVER(PARTITION BY binned_agg_5_min.device_id, binned_agg_5_min.sensor_id ORDER BY binned_agg_5_min.time_bin DESC ROWS BETWEEN 3 PRECEDING AND 0 PRECEDING) fifteen_min_running_avg_pressure
+        FROM
+          binned_agg_5_min
+        LEFT OUTER JOIN
+          binned_agg_1_hr ba_1_hr
+        ON (
+          binned_agg_5_min.device_id = ba_1_hr.device_id
+            AND
+          date_trunc('hour', binned_agg_5_min.time_bin) = date_add('day', 1, ba_1_hr.time_bin_hr)
+        )
+        LEFT JOIN
+          "prod-gem-plat-event-database"."prod-gem-plat-alert-thresholds-table" threshold_table
+        ON
+          binned_agg_5_min.fleet_activation_code = threshold_table.fleet_activation_code
+        WHERE
+          binned_agg_5_min.numb_pressure_spikes = 0
+      ),
+      -- 3.2 Detect UIs (with duplicates)
+      detected_UI__with_duplicates as (
+        SELECT
+          du.device_id,
+          du.sensor_id,
+          'UI' event_type,
+          du.time_bin,
+          du.latest_transmission_timestamp,
+          du.minimized_pressure_timestamp,
+          du.set_point,
+          du.pressure,
+          du.temperature,
+          du.temperature_delta,
+          du.coldsnap_flag,
+          approx_cip.cip,
+          du.fifteen_min_running_avg_pressure >= 30 override_blowout,
+          pressure_set_point_ratio,
+          preceding_pressure_set_point_ratio > minor_threshold first_breach
+        FROM
+          detected_UI__raw_data du
+        LEFT JOIN
+          approx_cip
+        ON
+          du.device_id = approx_cip.device_id
+        AND
+          du.sensor_id = approx_cip.sensor_id
+        AND
+          du.time_bin = approx_cip.time_bin
+        WHERE
+          pressure_set_point_ratio <= minor_threshold
+        AND
+          (
+            (readings > 1 AND inferred_power_mode = 'EXTERN' AND du.sensor_type = 'screw_on_sensor')
+            OR
+            (inferred_power_mode = 'LION')
+            OR
+            (du.sensor_type = 'cyclone_sensor')
+          )
+      ),
+      -- 3.3 Calculate preceding pressure_set_point_ratio (only for records that passed initial evaluation)
+      detected_UI__deduplication_calc as (
+        SELECT
+          du.device_id,
+          du.sensor_id,
+          du.event_type,
+          du.time_bin,
+          du.latest_transmission_timestamp,
+          du.minimized_pressure_timestamp,
+          du.set_point,
+          du.pressure,
+          du.temperature,
+          du.temperature_delta,
+          du.coldsnap_flag,
+          du.cip,
+          du.override_blowout,
+          first_breach,
+          pressure_set_point_ratio,
+          lag(pressure_set_point_ratio, 1, 1) over(partition by sensor_id order by time_bin asc) preceding_pressure_set_point_ratio
+        FROM
+          detected_UI__with_duplicates du
+      ),
+      -- 3.4 Detect UIs
+      detected_UI as (
+        SELECT
+          du.device_id,
+          du.sensor_id,
+          du.event_type,
+          du.time_bin,
+          du.latest_transmission_timestamp,
+          du.minimized_pressure_timestamp,
+          du.set_point,
+          du.pressure,
+          du.temperature,
+          du.temperature_delta,
+          du.coldsnap_flag,
+          du.cip,
+          du.override_blowout
+        FROM
+          detected_UI__deduplication_calc du
+        WHERE
+          (
+            -- Previous raw reading was above the UI threshold
+            first_breach
+              OR
+            -- PSI drops even further
+            preceding_pressure_set_point_ratio > pressure_set_point_ratio
+          )
+      ),
+      -- 4. Check for OI
+      -- 4.1 Calculate the relevant metrics for OI Detection
+      detected_OI__raw_data as (
+        SELECT
+          ba_5_min.device_id,
+          ba_5_min.sensor_id,
+          ba_5_min.time_bin,
+          ba_5_min.latest_transmission_timestamp,
+          ba_5_min.minimized_pressure_timestamp,
+          ba_5_min.set_point,
+          ba_5_min.avg_pressure pressure,
+          ba_5_min.temperature,
+          NULL temperature_delta,
+          0 coldsnap_flag,
+          ba_5_min.raw_pressure_based_cip cip,
+          ba_5_min.avg_pressure > 40 +  ba_5_min.set_point OR ba_5_min.raw_pressure_based_cip >= 1.20 * ba_5_min.set_point tire_overinflated,
+          LAG(ba_5_min.avg_pressure > 40 + ba_5_min.set_point OR ba_5_min.raw_pressure_based_cip >= 1.20 * ba_5_min.set_point, 1, false) OVER(PARTITION BY ba_5_min.sensor_id ORDER BY ba_5_min.time_bin ASC) preceeding_tire_overinflated
+        FROM
+          binned_agg_5_min ba_5_min
+      ),
+      detected_OI as (
+        SELECT
+          device_id,
+          sensor_id,
+          'OI' event_type,
+          time_bin,
+          latest_transmission_timestamp,
+          minimized_pressure_timestamp,
+          set_point,
+          pressure,
+          temperature,
+          temperature_delta,
+          coldsnap_flag,
+          cip,
+          NULL override_blowout
+        FROM
+          detected_OI__raw_data
+        WHERE
+          tire_overinflated
+        AND NOT
+          preceeding_tire_overinflated
+      ),
+      -- 5. Check for UI recovery
+      -- 5.1 Prepare the necessary data for UI Recovery detection
+      detected_UI_recovery__raw_data as (
+        SELECT
+          device_id,
+          sensor_id,
+          time_bin,
+          latest_transmission_timestamp,
+          minimized_pressure_timestamp,
+          set_point,
+          avg_pressure pressure,
+          temperature,
+          temperature_delta,
+          CASE
+            WHEN temperature_delta < -11 THEN 1
+            ELSE 0
+          END coldsnap_flag,
+          cip
+        FROM
+          approx_cip
+        WHERE
+          cip/set_point >= 0.90
+      ),
+      -- 5.2 Detect UI recovery
+      detected_UI_recovery as (
+        SELECT
+          device_id,
+          sensor_id,
+          'UI_RECOVERED' event_type,
+          time_bin,
+          latest_transmission_timestamp,
+          minimized_pressure_timestamp,
+          set_point,
+          pressure,
+          temperature,
+          temperature_delta,
+          coldsnap_flag,
+          cip,
+          NULL override_blowout
+        FROM
+          detected_UI_recovery__raw_data
+        WHERE
+          hour(time_bin) % 4 = 0
+        AND
+          minute(time_bin) = 0
+      ),
+      -- 6. Check for BO/OI recovery
+      -- 6.1 Prepare the necessary data for BO/OI Recovery detection
+      detected_BO_OI_recovery__raw_data as (
+        SELECT
+          ba_5_min.device_id,
+          ba_5_min.sensor_id,
+          ba_5_min.time_bin,
+          ba_5_min.latest_transmission_timestamp,
+          ba_5_min.minimized_pressure_timestamp,
+          ba_5_min.set_point,
+          ba_5_min.avg_pressure pressure,
+          ba_5_min.temperature,
+          approx_cip.temperature_delta,
+          CASE WHEN approx_cip.temperature_delta < -11 THEN 1 ELSE 0 END coldsnap_flag,
+          approx_cip.cip,
+          ba_5_min.raw_pressure_based_cip,
+          AVG(ba_5_min.avg_pressure) OVER(PARTITION BY ba_5_min.device_id, ba_5_min.sensor_id ORDER BY ba_5_min.time_bin DESC ROWS BETWEEN 3 PRECEDING AND 0 PRECEDING) fifteen_min_running_avg_pressure
+        FROM
+          binned_agg_5_min ba_5_min
+        LEFT JOIN
+          approx_cip
+        ON
+          ba_5_min.device_id = approx_cip.device_id
+        AND
+          ba_5_min.sensor_id = approx_cip.sensor_id
+        AND
+          ba_5_min.time_bin = approx_cip.time_bin
+      ),
+      -- 6.2 Pull all known tire event states
+      event_states AS (
+        SELECT
+          device_id,
+          sensor_id,
+          vehicle_id,
+          id,
+          type,
+          severity,
+          time,
+          FROM_MILLISECONDS(CAST(pressure_timestamp AS BIGINT)) pressure_timestamp,
+          measure_name,
+          ROW_NUMBER() OVER (PARTITION BY device_id, sensor_id ORDER BY time, cast(id as bigint)) AS rn
+        FROM
+          "${ event.dbName }"."${ event.tireEventsTableName }"
+      ),
+      -- 6.3 Find the latest tire event status for every device_id/sensor_id
+      -- the query finds a status that was effective at time_bin, which is necessary to make the query reproducible
+      -- for the sake of easier debugging, i.e. no matter when the query is executed - the result would aways be the same
+      detected_BO_OI_recovery__raw_data_with_events AS (
+        SELECT
+          bo_oi_recovery_rd.device_id,
+          bo_oi_recovery_rd.sensor_id,
+          bo_oi_recovery_rd.time_bin,
+          bo_oi_recovery_rd.latest_transmission_timestamp,
+          bo_oi_recovery_rd.minimized_pressure_timestamp,
+          bo_oi_recovery_rd.set_point,
+          bo_oi_recovery_rd.pressure,
+          bo_oi_recovery_rd.temperature,
+          bo_oi_recovery_rd.temperature_delta,
+          bo_oi_recovery_rd.coldsnap_flag,
+          bo_oi_recovery_rd.cip,
+          bo_oi_recovery_rd.raw_pressure_based_cip,
+          bo_oi_recovery_rd.fifteen_min_running_avg_pressure,
+          MAX_BY(es.type, es.rn) tire_event_type,
+          MAX_BY(es.measure_name, es.rn) tire_event_measure_name
+        FROM
+          detected_BO_OI_recovery__raw_data bo_oi_recovery_rd
+        LEFT JOIN
+          event_states es
+        ON
+          es.device_id = bo_oi_recovery_rd.device_id
+        AND
+          es.sensor_id = bo_oi_recovery_rd.sensor_id
+        AND
+          es.time < bo_oi_recovery_rd.time_bin
+        GROUP BY
+          bo_oi_recovery_rd.device_id,
+          bo_oi_recovery_rd.sensor_id,
+          bo_oi_recovery_rd.time_bin,
+          bo_oi_recovery_rd.latest_transmission_timestamp,
+          bo_oi_recovery_rd.minimized_pressure_timestamp,
+          bo_oi_recovery_rd.set_point,
+          bo_oi_recovery_rd.pressure,
+          bo_oi_recovery_rd.temperature,
+          bo_oi_recovery_rd.temperature_delta,
+          bo_oi_recovery_rd.coldsnap_flag,
+          bo_oi_recovery_rd.cip,
+          bo_oi_recovery_rd.raw_pressure_based_cip,
+          bo_oi_recovery_rd.fifteen_min_running_avg_pressure
+      ),
+      -- 6.4 Detect BO/OI recovery
+      -- it checks the latest tire event status to see if a tire being assessed has an open BO/OI event
+      detected_BO_OI_recovery as (
+        SELECT
+          bo_oi_recovery_rd.device_id,
+          bo_oi_recovery_rd.sensor_id,
+          CASE
+            WHEN bo_oi_recovery_rd.tire_event_type = 'BO' THEN 'BO_RECOVERED'
+            ELSE 'OI_RECOVERED'
+          END as event_type,
+          bo_oi_recovery_rd.time_bin,
+          bo_oi_recovery_rd.latest_transmission_timestamp,
+          bo_oi_recovery_rd.minimized_pressure_timestamp,
+          bo_oi_recovery_rd.set_point,
+          bo_oi_recovery_rd.pressure,
+          bo_oi_recovery_rd.temperature,
+          bo_oi_recovery_rd.temperature_delta,
+          bo_oi_recovery_rd.coldsnap_flag,
+          bo_oi_recovery_rd.cip,
+          NULL override_blowout
+        FROM
+          detected_BO_OI_recovery__raw_data_with_events bo_oi_recovery_rd
+        WHERE
+          bo_oi_recovery_rd.tire_event_measure_name != 'issue_resolved'
+        AND (
+          (bo_oi_recovery_rd.tire_event_type = 'BO' AND bo_oi_recovery_rd.fifteen_min_running_avg_pressure >= 30)
+          OR
+          (bo_oi_recovery_rd.tire_event_type = 'OI' AND bo_oi_recovery_rd.raw_pressure_based_cip < 1.10 * bo_oi_recovery_rd.set_point)
+        )
+      ),
+      -- Combine all the results
+      --- 1. In the state manger, there should be a natural precedence for alerts
+      ----- BO/MAINT --> LEAK & UI --> LEAK --> UI
+      detected_events AS (
+        (
+          SELECT
+            *
+          FROM
+            detected_BO_MAINTs
+        )
+        UNION ALL
+        (
+          SELECT
+            *
+          FROM
+            detected_LEAKs
+        )
+        UNION ALL
+        (
+          SELECT
+            *
+          FROM
+            detected_UI
+        )
+        UNION ALL
+        (
+          SELECT
+            *
+          FROM
+            detected_OI
+        )
+        UNION ALL
+        (
+          SELECT
+            *
+          FROM
+            detected_UI_recovery
+        )
+        UNION ALL
+        (
+          SELECT
+            *
+          FROM
+            detected_BO_OI_recovery
+        )
+      )
+      SELECT
+        *
+      FROM
+        detected_events
